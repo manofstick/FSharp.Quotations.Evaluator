@@ -461,6 +461,9 @@ module QuotationEvaluationTypes =
             | SpecificCall <@ ( <= ) @> (_,_,[x1;x2]) -> transComparison x1 x2 Expression.LessThanOrEqual    Expression.LessThanOrEqual    genericLessOrEqualIntrinsic
             | SpecificCall <@ ( <> ) @> (_,_,[x1;x2]) -> transComparison x1 x2 Expression.NotEqual           Expression.NotEqual           genericNotEqualIntrinsic
 
+            | SpecificCall <@ ( <| ) @> (_,_,[Lambda (_, Call (None,   f, hd::tl)); p2]) -> ConvExpr env (Expr.Call (f, p2::tl))
+            | SpecificCall <@ ( <| ) @> (_,_,[Lambda (_, Call (Some o, f, hd::tl)); p2]) -> ConvExpr env (Expr.Call (o, f, p2::tl))
+
             | NotQ (_, _,[x1])    -> Expression.Not(ConvExpr env x1)                                   |> asExpr
 
 
