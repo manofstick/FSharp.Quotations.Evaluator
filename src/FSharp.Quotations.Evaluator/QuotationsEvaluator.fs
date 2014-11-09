@@ -368,17 +368,22 @@ module QuotationEvaluationTypes =
     let (|ArrayAssignQ|_|) = (|SpecificCall|_|) <@ LanguagePrimitives.IntrinsicFunctions.SetArray : int[] -> int -> int -> unit @>
     let (|ArrayTypeQ|_|) (ty:System.Type) = if ty.IsArray && ty.GetArrayRank() = 1 then Some(ty.GetElementType()) else None
     
+    type Functions = {
+        Dummy : int
+    }
+
+    let return' (ζ:Functions) (e:#Expression) =
+        ζ, (e :> Expression)
+
     /// Convert F# quotations to LINQ expression trees.
     /// A more polished LINQ-Quotation translator will be published
     /// concert with later versions of LINQ.
-    let rec ConvExpr (env:ConvEnv) (inp:Expr) = 
+    let rec ConvExpr (ζ:Functions) (env:ConvEnv) (inp:Expr) : Functions*Expression = 
        //printf "ConvExpr : %A\n" e;
         match inp with 
-
-        // Generic cases 
         | Patterns.Var(v) -> 
                 try
-                    Map.find v env.varEnv
+                    ζ, Map.find v env.varEnv
                 with
                 |   :? KeyNotFoundException when v.Name = "this" ->
                         let message = 
@@ -395,27 +400,43 @@ module QuotationEvaluationTypes =
                             "       let bar() = let x = x in <@ x @>\r\n";
 
                         NotSupportedException(message) |> raise    
-        | DerivedPatterns.AndAlso(x1,x2)             -> Expression.AndAlso(ConvExpr env x1, ConvExpr env x2) |> asExpr
-        | DerivedPatterns.OrElse(x1,x2)              -> Expression.OrElse(ConvExpr env x1, ConvExpr env x2)  |> asExpr
-        | Patterns.Value(x,ty)                -> Expression.Constant(x,ty)              |> asExpr
+
+        | DerivedPatterns.AndAlso(x1,x2) ->
+            let ζ, exp1 = ConvExpr ζ env x1
+            let ζ, exp2 = ConvExpr ζ env x2
+            return' ζ <| Expression.AndAlso(exp1, exp2)
+
+        | DerivedPatterns.OrElse(x1,x2) ->
+            let ζ, exp1 = ConvExpr ζ env x1
+            let ζ, exp2 = ConvExpr ζ env x2
+            return' ζ <| Expression.OrElse(exp1, exp2)
+
+        | Patterns.Value(x,ty) ->
+            return' ζ <| Expression.Constant(x,ty)
 
         // REVIEW: exact F# semantics for TypeAs and TypeIs
-        | Patterns.Coerce(x,toTy)             -> Expression.TypeAs(ConvExpr env x,toTy)     |> asExpr
-        | Patterns.TypeTest(x,toTy)           -> Expression.TypeIs(ConvExpr env x,toTy)     |> asExpr
+        | Patterns.Coerce(x,toTy) ->
+            let ζ, exp1 = ConvExpr ζ env x
+            return' ζ <| Expression.TypeAs(exp1,toTy)
+
+        | Patterns.TypeTest(x,toTy) ->
+            let ζ, exp1 = ConvExpr ζ env x
+            return' ζ <| Expression.TypeIs(exp1,toTy)
         
         // Expr.*Get
         | Patterns.FieldGet(objOpt,fieldInfo) -> 
-            Expression.Field(ConvObjArg env objOpt None, fieldInfo) |> asExpr
+            let ζ, exp1 = ConvObjArg ζ env objOpt None
+            return' ζ <| Expression.Field(exp1, fieldInfo)
 
         | Patterns.TupleGet(arg,n) -> 
-             let argP = ConvExpr env arg 
+             let ζ, argP = ConvExpr ζ env arg 
              let rec build ty argP n = 
                  match Reflection.FSharpValue.PreComputeTuplePropertyInfo(ty,n) with 
                  | propInfo,None -> 
                      Expression.Property(argP, propInfo)  |> asExpr
                  | propInfo,Some(nestedTy,n2) -> 
                      build nestedTy (Expression.Property(argP,propInfo) |> asExpr) n2
-             build arg.Type argP n
+             return' ζ <| build arg.Type argP n
               
         | Patterns.PropertyGet(objOpt,propInfo,args) -> 
             let coerceTo = 
@@ -424,34 +445,39 @@ module QuotationEvaluationTypes =
                 else 
                     None
             match args with 
-            | [] -> 
-                Expression.Property(ConvObjArg env objOpt coerceTo, propInfo) |> asExpr
-            | _ -> 
-                let argsP = ConvExprs env args
-                Expression.Call(ConvObjArg env objOpt coerceTo, propInfo.GetGetMethod(true),argsP) |> asExpr
+            | [] ->
+                let ζ, argsP = ConvObjArg ζ env objOpt coerceTo
+                return' ζ <| Expression.Property(argsP, propInfo)
+            | _ ->
+                let ζ, instance = ConvObjArg ζ env objOpt coerceTo
+                let ζ, argsP = ConvExprs ζ env args
+                return' ζ <| Expression.Call(instance, propInfo.GetGetMethod(true),argsP)
 
         // Expr.*Set
         | Patterns.PropertySet(objOpt,propInfo,args,v) -> 
             let args = (args @ [v])
-            let argsP = ConvExprs env args 
+            let ζ, argsP = ConvExprs ζ env args 
             let minfo = propInfo.GetSetMethod(true)
-            Expression.Call(ConvObjArg env objOpt None, minfo,argsP) |> asExpr |> WrapVoid (IsVoidType minfo.ReturnType) objOpt args env 
+            let ζ, instance = ConvObjArg ζ env objOpt None
+            let setter = Expression.Call(instance, minfo,argsP) |> asExpr |> WrapVoid (IsVoidType minfo.ReturnType) objOpt args env 
+            return' ζ <| setter
 
         // Expr.(Call,Application)
         | Patterns.Call(objOpt,minfo,args) -> 
             let transComparison x1 x2 exprConstructor exprErasedConstructor (intrinsic : MethodInfo) =
-                let e1 = ConvExpr env x1
-                let e2 = ConvExpr env x2
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
 
                 if e1.Type.IsPrimitive || env.eraseEquality then
-                    exprErasedConstructor(e1,e2) |> asExpr
+                    return' ζ <| exprErasedConstructor(e1,e2)
                 else 
-                    exprConstructor(e1, e2, false, intrinsic.MakeGenericMethod([|x1.Type|])) |> asExpr
+                    return' ζ <| exprConstructor(e1, e2, false, intrinsic.MakeGenericMethod([|x1.Type|]))
 
             match inp with 
             // Special cases for this translation
             |  PlusQ (_, [ty1;ty2;ty3],[x1;x2]) when (ty1 = typeof<string>) && (ty2 = typeof<string>) ->
-                 ConvExpr env (<@@  System.String.Concat( [| %%x1 ; %%x2 |] : string array ) @@>)
+                 let ζ, e1 = ConvExpr ζ env (<@@  System.String.Concat( [| %%x1 ; %%x2 |] : string array ) @@>)
+                 return' ζ <| e1
 
             | SpecificCall <@ LanguagePrimitives.GenericEquality @> (_, _,[x1;x2]) 
             | SpecificCall <@ ( =  ) @> (_,_,[x1;x2]) -> transComparison x1 x2 Expression.Equal              Expression.Equal              genericEqualityIntrinsic
@@ -461,76 +487,209 @@ module QuotationEvaluationTypes =
             | SpecificCall <@ ( <= ) @> (_,_,[x1;x2]) -> transComparison x1 x2 Expression.LessThanOrEqual    Expression.LessThanOrEqual    genericLessOrEqualIntrinsic
             | SpecificCall <@ ( <> ) @> (_,_,[x1;x2]) -> transComparison x1 x2 Expression.NotEqual           Expression.NotEqual           genericNotEqualIntrinsic
 
-            | SpecificCall <@ ( <| ) @> (_,_,[Lambda (_, Call (None,   f, hd::tl)); p2]) -> ConvExpr env (Expr.Call (f, p2::tl))
-            | SpecificCall <@ ( <| ) @> (_,_,[Lambda (_, Call (Some o, f, hd::tl)); p2]) -> ConvExpr env (Expr.Call (o, f, p2::tl))
+            | SpecificCall <@ ( <| ) @> (_,_,[Lambda (_, Call (None,   f, hd::tl)); p2]) -> ConvExpr ζ env (Expr.Call (f, p2::tl))
+            | SpecificCall <@ ( <| ) @> (_,_,[Lambda (_, Call (Some o, f, hd::tl)); p2]) -> ConvExpr ζ env (Expr.Call (o, f, p2::tl))
 
-            | NotQ (_, _,[x1])    -> Expression.Not(ConvExpr env x1)                                   |> asExpr
+            | NotQ (_, _,[x1])    ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Not(e1)
 
+            | NegQ (_, _,[x1])    ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Negate(e1)
 
-            | NegQ (_, _,[x1])    -> Expression.Negate(ConvExpr env x1)                                |> asExpr
-            | PlusQ (_, _,[x1;x2]) -> Expression.Add(ConvExpr env x1, ConvExpr env x2)      |> asExpr
-            | DivideQ (_, _,[x1;x2]) -> Expression.Divide (ConvExpr env x1, ConvExpr env x2)  |> asExpr
-            | MinusQ (_, _,[x1;x2]) -> Expression.Subtract(ConvExpr env x1, ConvExpr env x2) |> asExpr
-            | MultiplyQ (_, _,[x1;x2]) -> Expression.Multiply(ConvExpr env x1, ConvExpr env x2) |> asExpr
-            | ModuloQ (_, _,[x1;x2]) -> Expression.Modulo (ConvExpr env x1, ConvExpr env x2) |> asExpr
+            | PlusQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.Add(e1, e2)
+
+            | DivideQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.Divide (e1, e2)
+
+            | MinusQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.Subtract(e1, e2)
+
+            | MultiplyQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.Multiply(e1, e2)
+
+            | ModuloQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.Modulo (e1, e2)
+
                  /// REVIEW: basic arithmetic with method witnesses
                  /// REVIEW: negate,add, divide, multiply, subtract with method witness
 
-            | ShiftLeftQ (_, _,[x1;x2]) -> Expression.LeftShift(ConvExpr env x1, ConvExpr env x2) |> asExpr
-            | ShiftRightQ (_, _,[x1;x2]) -> Expression.RightShift(ConvExpr env x1, ConvExpr env x2) |> asExpr
-            | BitwiseAndQ (_, _,[x1;x2]) -> Expression.And(ConvExpr env x1, ConvExpr env x2) |> asExpr
-            | BitwiseOrQ (_, _,[x1;x2]) -> Expression.Or(ConvExpr env x1, ConvExpr env x2) |> asExpr
-            | BitwiseXorQ (_, _,[x1;x2]) -> Expression.ExclusiveOr(ConvExpr env x1, ConvExpr env x2) |> asExpr
-            | BitwiseNotQ (_, _,[x1]) -> Expression.Not(ConvExpr env x1) |> asExpr
+            | ShiftLeftQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.LeftShift(e1, e2)
+
+            | ShiftRightQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.RightShift(e1, e2)
+
+            | BitwiseAndQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.And(e1, e2)
+
+            | BitwiseOrQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.Or(e1, e2)
+
+            | BitwiseXorQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.ExclusiveOr(e1, e2)
+
+            | BitwiseNotQ (_, _,[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Not(e1)
                  /// REVIEW: bitwise operations with method witnesses
 
-            | CheckedNeg (_, _,[x1]) -> Expression.NegateChecked(ConvExpr env x1)                                |> asExpr
-            | CheckedPlusQ (_, _,[x1;x2]) -> Expression.AddChecked(ConvExpr env x1, ConvExpr env x2)      |> asExpr
-            | CheckedMinusQ (_, _,[x1;x2]) -> Expression.SubtractChecked(ConvExpr env x1, ConvExpr env x2) |> asExpr
-            | CheckedMultiplyQ (_, _,[x1;x2]) -> Expression.MultiplyChecked(ConvExpr env x1, ConvExpr env x2) |> asExpr
+            | CheckedNeg (_, _,[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.NegateChecked(e1)
 
-            | ConvCharQ (_, [ty],[x1])  -> Expression.Convert(ConvExpr env x1, typeof<char>) |> asExpr
-            | ConvDecimalQ (_, [ty],[x1])  -> Expression.Convert(ConvExpr env x1, typeof<decimal>) |> asExpr
-            | ConvFloatQ (_, [ty],[x1])  -> Expression.Convert(ConvExpr env x1, typeof<float>) |> asExpr
-            | ConvFloat32Q (_, [ty],[x1])  -> Expression.Convert(ConvExpr env x1, typeof<float32>) |> asExpr
-            | ConvSByteQ (_, [ty],[x1])  -> Expression.Convert(ConvExpr env x1, typeof<sbyte>) |> asExpr
-            | ConvInt16Q (_, [ty],[x1])  -> Expression.Convert(ConvExpr env x1, typeof<int16>) |> asExpr
-            | ConvInt32Q (_, [ty],[x1])  -> Expression.Convert(ConvExpr env x1, typeof<int32>) |> asExpr
-            | ConvIntQ (_, [ty],[x1])    -> Expression.Convert(ConvExpr env x1, typeof<int32>) |> asExpr
-            | ConvInt64Q (_, [ty],[x1])  -> Expression.Convert(ConvExpr env x1, typeof<int64>) |> asExpr
-            | ConvByteQ (_, [ty],[x1])   -> Expression.Convert(ConvExpr env x1, typeof<byte>) |> asExpr
-            | ConvUInt16Q (_, [ty],[x1]) -> Expression.Convert(ConvExpr env x1, typeof<uint16>) |> asExpr
-            | ConvUInt32Q (_, [ty],[x1]) -> Expression.Convert(ConvExpr env x1, typeof<uint32>) |> asExpr
-            | ConvUInt64Q (_, [ty],[x1]) -> Expression.Convert(ConvExpr env x1, typeof<uint64>) |> asExpr
+            | CheckedPlusQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.AddChecked(e1, e2)
+
+            | CheckedMinusQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.SubtractChecked(e1, e2)
+
+            | CheckedMultiplyQ (_, _,[x1;x2]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.MultiplyChecked(e1, e2)
+
+            | ConvCharQ (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<char>)
+
+            | ConvDecimalQ (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<decimal>)
+
+            | ConvFloatQ (_, [ty],[x1])  ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<float>)
+
+            | ConvFloat32Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<float32>)
+
+            | ConvSByteQ (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<sbyte>)
+
+            | ConvInt16Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<int16>)
+
+            | ConvInt32Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<int32>)
+
+            | ConvIntQ (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<int32>)
+
+            | ConvInt64Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<int64>)
+
+            | ConvByteQ (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<byte>)
+
+            | ConvUInt16Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<uint16>)
+
+            | ConvUInt32Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<uint32>)
+
+            | ConvUInt64Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.Convert(e1, typeof<uint64>)
+
              /// REVIEW: convert with method witness
 
-            | CheckedConvCharQ (_, [ty],[x1])  -> Expression.ConvertChecked(ConvExpr env x1, typeof<char>) |> asExpr
-            | CheckedConvSByteQ (_, [ty],[x1])  -> Expression.ConvertChecked(ConvExpr env x1, typeof<sbyte>) |> asExpr
-            | CheckedConvInt16Q (_, [ty],[x1])  -> Expression.ConvertChecked(ConvExpr env x1, typeof<int16>) |> asExpr
-            | CheckedConvInt32Q (_, [ty],[x1])  -> Expression.ConvertChecked(ConvExpr env x1, typeof<int32>) |> asExpr
-            | CheckedConvInt64Q (_, [ty],[x1])  -> Expression.ConvertChecked(ConvExpr env x1, typeof<int64>) |> asExpr
-            | CheckedConvByteQ (_, [ty],[x1])   -> Expression.ConvertChecked(ConvExpr env x1, typeof<byte>) |> asExpr
-            | CheckedConvUInt16Q (_, [ty],[x1]) -> Expression.ConvertChecked(ConvExpr env x1, typeof<uint16>) |> asExpr
-            | CheckedConvUInt32Q (_, [ty],[x1]) -> Expression.ConvertChecked(ConvExpr env x1, typeof<uint32>) |> asExpr
-            | CheckedConvUInt64Q (_, [ty],[x1]) -> Expression.ConvertChecked(ConvExpr env x1, typeof<uint64>) |> asExpr
+            | CheckedConvCharQ (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.ConvertChecked(e1, typeof<char>)
+
+            | CheckedConvSByteQ (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.ConvertChecked(e1, typeof<sbyte>)
+
+            | CheckedConvInt16Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.ConvertChecked(e1, typeof<int16>)
+
+            | CheckedConvInt32Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.ConvertChecked(e1, typeof<int32>)
+
+            | CheckedConvInt64Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.ConvertChecked(e1, typeof<int64>)
+
+            | CheckedConvByteQ (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.ConvertChecked(e1, typeof<byte>)
+
+            | CheckedConvUInt16Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.ConvertChecked(e1, typeof<uint16>)
+
+            | CheckedConvUInt32Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.ConvertChecked(e1, typeof<uint32>)
+
+            | CheckedConvUInt64Q (_, [ty],[x1]) ->
+                let ζ, e1 = ConvExpr ζ env x1
+                return' ζ <| Expression.ConvertChecked(e1, typeof<uint64>)
+
             | ArrayLookupQ (_, [ArrayTypeQ(elemTy);_;_],[x1;x2]) -> 
-                Expression.ArrayIndex(ConvExpr env x1, ConvExpr env x2) |> asExpr
+                let ζ, e1 = ConvExpr ζ env x1
+                let ζ, e2 = ConvExpr ζ env x2
+                return' ζ <| Expression.ArrayIndex(e1, e2)
 
             | ArrayAssignQ (_, [ArrayTypeQ(elemTy);_;_],[arr;idx;elem]) -> 
                 let minfo = ArrayAssignMethod.GetGenericMethodDefinition().MakeGenericMethod [| elemTy;typeof<unit> |]
-                Expression.Call(minfo,[| ConvExpr env arr; ConvExpr env idx; ConvExpr env elem |]) |> asExpr
+                let ζ, array' = ConvExpr ζ env arr
+                let ζ, index' = ConvExpr ζ env idx
+                let ζ, element' = ConvExpr ζ env elem
+                return' ζ <| Expression.Call(minfo,[| array'; index'; element' |])
             
             // Throw away markers inserted to satisfy C#'s design where they pass an argument
             // or type T to an argument expecting Expr<T>.
-            | LinqExpressionHelperQ (_, [_],[x1]) -> ConvExpr env x1
+            | LinqExpressionHelperQ (_, [_],[x1]) -> ConvExpr ζ env x1
              
               /// ArrayLength
               /// ListBind
               /// ListInit
               /// ElementInit
             | _ -> 
-                let argsP = ConvExprs env args 
-                Expression.Call(ConvObjArg env objOpt None, minfo, argsP) |> asExpr |> WrapVoid (IsVoidType minfo.ReturnType) objOpt args env 
+                let ζ, instance = ConvObjArg ζ env objOpt None
+                let ζ, argsP = ConvExprs ζ env args 
+                let other = Expression.Call(instance, minfo, argsP) |> asExpr |> WrapVoid (IsVoidType minfo.ReturnType) objOpt args env 
+                return' ζ <| other
 
         // f x1 x2 x3 x4 --> InvokeFast4
         | Patterns.Application(Patterns.Application(Patterns.Application(Patterns.Application(f,arg1),arg2),arg3),arg4) -> 
@@ -541,8 +700,8 @@ module QuotationEvaluationTypes =
             let (-->) ty1 ty2 = Reflection.FSharpType.MakeFunctionType(ty1,ty2)
             let ty = domainTy1 --> domainTy2 
             let meth = (ty.GetMethods() |> Array.find (fun minfo -> minfo.Name = "InvokeFast" && minfo.GetParameters().Length = 5)).MakeGenericMethod [| domainTy3; domainTy4; rangeTy |]
-            let argsP = ConvExprs env [f; arg1;arg2;arg3; arg4]
-            Expression.Call((null:Expression), meth, argsP) |> asExpr
+            let ζ, argsP = ConvExprs ζ env [f; arg1;arg2;arg3; arg4]
+            return' ζ <| Expression.Call((null:Expression), meth, argsP)
 
         // f x1 x2 x3 --> InvokeFast3
         | Patterns.Application(Patterns.Application(Patterns.Application(f,arg1),arg2),arg3) -> 
@@ -552,8 +711,8 @@ module QuotationEvaluationTypes =
             let (-->) ty1 ty2 = Reflection.FSharpType.MakeFunctionType(ty1,ty2)
             let ty = domainTy1 --> domainTy2 
             let meth = (ty.GetMethods() |> Array.find (fun minfo -> minfo.Name = "InvokeFast" && minfo.GetParameters().Length = 4)).MakeGenericMethod [| domainTy3; rangeTy |]
-            let argsP = ConvExprs env [f; arg1;arg2;arg3]
-            Expression.Call((null:Expression), meth, argsP) |> asExpr
+            let ζ, argsP = ConvExprs ζ env [f; arg1;arg2;arg3]
+            return' ζ <| Expression.Call((null:Expression), meth, argsP)
 
         // f x1 x2 --> InvokeFast2
         | Patterns.Application(Patterns.Application(f,arg1),arg2) -> 
@@ -562,35 +721,37 @@ module QuotationEvaluationTypes =
             let (-->) ty1 ty2 = Reflection.FSharpType.MakeFunctionType(ty1,ty2)
             let ty = domainTy1 --> domainTy2 
             let meth = (ty.GetMethods() |> Array.find (fun minfo -> minfo.Name = "InvokeFast" && minfo.GetParameters().Length = 3)).MakeGenericMethod [| rangeTy |]
-            let argsP = ConvExprs env [f; arg1;arg2]
-            Expression.Call((null:Expression), meth, argsP) |> asExpr
+            let ζ, argsP = ConvExprs ζ env [f; arg1;arg2]
+            return' ζ <| Expression.Call((null:Expression), meth, argsP)
 
         // f x1 --> Invoke
         | Patterns.Application(f,arg) -> 
-            let fP = ConvExpr env f
-            let argP = ConvExpr env arg
+            let ζ, fP = ConvExpr ζ env f
+            let ζ, argP = ConvExpr ζ env arg
             let meth = f.Type.GetMethod("Invoke")
-            Expression.Call(fP, meth, [| argP |]) |> asExpr
+            return' ζ <| Expression.Call(fP, meth, [| argP |])
 
         // Expr.New*
         | Patterns.NewRecord(recdTy,args) -> 
-            let ctorInfo = Reflection.FSharpValue.PreComputeRecordConstructorInfo(recdTy,showAll) 
-            Expression.New(ctorInfo,ConvExprs env args) |> asExpr
+            let ctorInfo = Reflection.FSharpValue.PreComputeRecordConstructorInfo(recdTy,showAll)
+            let ζ, n = ConvExprs ζ env args
+            return' ζ <| Expression.New(ctorInfo, n)
 
-        | Patterns.NewArray(ty,args) -> 
-            Expression.NewArrayInit(ty,ConvExprs env args) |> asExpr
+        | Patterns.NewArray(ty,args) ->
+            let ζ, n = ConvExprs ζ env args
+            return' ζ <| Expression.NewArrayInit(ty, n)
 
         | Patterns.DefaultValue(ty) -> 
-            Expression.New(ty) |> asExpr
+            return' ζ <| Expression.New(ty)
 
         | Patterns.NewUnionCase(unionCaseInfo,args) -> 
             let methInfo = Reflection.FSharpValue.PreComputeUnionConstructorInfo(unionCaseInfo,showAll)
-            let argsR = ConvExprs env args 
-            Expression.Call((null:Expression),methInfo,argsR) |> asExpr
+            let ζ, argsR = ConvExprs ζ env args 
+            return' ζ <| Expression.Call((null:Expression),methInfo,argsR)
 
         | Patterns.UnionCaseTest(e,unionCaseInfo) -> 
             let methInfo = Reflection.FSharpValue.PreComputeUnionTagMemberInfo(unionCaseInfo.DeclaringType,showAll)
-            let obj = ConvExpr env e 
+            let ζ, obj = ConvExpr ζ env e 
             let tagE = 
                 match methInfo with 
                 | :? PropertyInfo as p -> 
@@ -598,65 +759,73 @@ module QuotationEvaluationTypes =
                 | :? MethodInfo as m -> 
                     Expression.Call((null:Expression),m,[| obj |]) |> asExpr
                 | _ -> failwith "unreachable case"
-            Expression.Equal(tagE, Expression.Constant(unionCaseInfo.Tag)) |> asExpr
+            return' ζ <| Expression.Equal(tagE, Expression.Constant(unionCaseInfo.Tag))
 
         | Patterns.NewObject(ctorInfo,args) -> 
-            Expression.New(ctorInfo,ConvExprs env args) |> asExpr
+            let ζ, n = ConvExprs ζ env args
+            return' ζ <| Expression.New(ctorInfo,n)
 
         | Patterns.NewDelegate(dty,vs,b) -> 
             let vsP = List.map ConvVar vs 
             let env = {env with varEnv = List.foldBack2 (fun (v:Var) vP -> Map.add v (vP |> asExpr)) vs vsP env.varEnv }
-            let bodyP = ConvExpr env b
-            Expression.Lambda(dty, bodyP, vsP) |> asExpr 
+            let ζ, bodyP = ConvExpr ζ env b
+            return' ζ <| Expression.Lambda(dty, bodyP, vsP)
 
         | Patterns.NewTuple(args) -> 
              let tupTy = args |> List.map (fun arg -> arg.Type) |> Array.ofList |> Reflection.FSharpType.MakeTupleType
-             let argsP = ConvExprs env args 
+             let ζ, argsP = ConvExprs ζ env args 
              let rec build ty (argsP: Expression[]) = 
                  match Reflection.FSharpValue.PreComputeTupleConstructorInfo(ty) with 
                  | ctorInfo,None -> Expression.New(ctorInfo,argsP) |> asExpr 
                  | ctorInfo,Some(nestedTy) -> 
                      let n = ctorInfo.GetParameters().Length - 1
                      Expression.New(ctorInfo, Array.append argsP.[0..n-1] [| build nestedTy argsP.[n..] |]) |> asExpr
-             build tupTy argsP
+             return' ζ <| build tupTy argsP
 
         | Patterns.IfThenElse(g,t,e) -> 
             match e with
-            | Patterns.Value(o,_) when o = null -> Expression.IfThen (ConvExpr env g, ConvExpr env t)|> asExpr
-            | _ -> Expression.Condition(ConvExpr env g, ConvExpr env t,ConvExpr env e) |> asExpr
+            | Patterns.Value(o,_) when o = null ->
+                let ζ, if' = ConvExpr ζ env g
+                let ζ, then' = ConvExpr ζ env t
+                return' ζ <| Expression.IfThen (if', then')
+            | _ ->
+                let ζ, if' = ConvExpr ζ env g
+                let ζ, then' = ConvExpr ζ env t
+                let ζ, else' = ConvExpr ζ env e
+                return' ζ <| Expression.Condition(if', then', else')
 
         | Patterns.Sequential (e1,e2) -> 
-            let e1P = ConvExpr env e1
-            let e2P = ConvExpr env e2
-            Expression.Block(e1P, e2P) |> asExpr
+            let ζ, e1P = ConvExpr ζ env e1
+            let ζ, e2P = ConvExpr ζ env e2
+            return' ζ <| Expression.Block(e1P, e2P)
 
         | Patterns.Let (v,e,b) -> 
             let vP = Expression.Variable (v.Type, v.Name)
-            let eP = ConvExpr env e
+            let ζ, eP = ConvExpr ζ env e
             let assign = Expression.Assign (vP, eP) |> asExpr
 
             let envInner = { env with varEnv = Map.add v (vP |> asExpr) env.varEnv } 
-            let bodyP = ConvExpr envInner b 
+            let ζ, bodyP = ConvExpr ζ envInner b 
 
-            Expression.Block ([vP], [assign; bodyP]) |> asExpr
+            return' ζ <| Expression.Block ([vP], [assign; bodyP])
 
         | Patterns.VarSet (variable, value) ->
             let linqVariable = Map.find variable env.varEnv
-            let linqValue = ConvExpr env value
-            Expression.Assign (linqVariable, linqValue)|> asExpr
+            let ζ, linqValue = ConvExpr ζ env value
+            return' ζ <| Expression.Assign (linqVariable, linqValue)
 
         | Patterns.Lambda(v,body) -> 
             let vP = ConvVar v
             let env = { env with varEnv = Map.add v (vP |> asExpr) env.varEnv }
             let tyargs = [| v.Type; body.Type |]
-            let bodyP = ConvExpr env body
+            let ζ, bodyP = ConvExpr ζ env body
             let convType = typedefof<System.Converter<obj,obj>>.MakeGenericType tyargs
             let convDelegate = Expression.Lambda(convType, bodyP, [| vP |]) |> asExpr
-            Expression.Call(typeof<FuncConvert>,"ToFSharpFunc",tyargs,[| convDelegate |]) |> asExpr
+            return' ζ <| Expression.Call(typeof<FuncConvert>,"ToFSharpFunc",tyargs,[| convDelegate |])
     
         | Patterns.WhileLoop(condition, iteration) -> 
-            let linqCondition = ConvExpr env condition
-            let linqIteration = ConvExpr env iteration
+            let ζ, linqCondition = ConvExpr ζ env condition
+            let ζ, linqIteration = ConvExpr ζ env iteration
 
             let breakLabel = Expression.Label ()
             let linqLoop =
@@ -669,22 +838,24 @@ module QuotationEvaluationTypes =
                     breakLabel)
             
             let linqAsUnitType =
-                Expression.Block(linqLoop, ConvExpr env <@ () @>)
+                let _, unit' = ConvExpr ζ env <@ () @>
+                Expression.Block(linqLoop, unit')
 
-            linqAsUnitType |> asExpr
+            return' ζ <| linqAsUnitType
 
         | Patterns.ForIntegerRangeLoop(indexer, lowerValue, upperValue, iteration) ->
-            let linqLowerValue = ConvExpr env lowerValue
-            let linqUpperValue = ConvExpr env upperValue
+            let ζ, linqLowerValue = ConvExpr ζ env lowerValue
+            let ζ, linqUpperValue = ConvExpr ζ env upperValue
             let linqIndexer = Expression.Variable (linqLowerValue.Type, indexer.Name)
             let linqAssignLower = Expression.Assign (linqIndexer, linqLowerValue)
             let linqCondition = Expression.LessThanOrEqual (linqIndexer, linqUpperValue)
             
             let envInner = { env with varEnv = Map.add indexer (linqIndexer |> asExpr) env.varEnv }
 
-            let linqIteration = 
-                Expression.Block (
-                    ConvExpr envInner iteration,
+            let ζ, linqIteration =
+                let ζ, linqIteration =  ConvExpr ζ envInner iteration
+                ζ, Expression.Block (
+                    linqIteration,
                     Expression.Assign(linqIndexer, Expression.Increment (linqIndexer)))
 
             let breakLabel = Expression.Label ()
@@ -703,23 +874,22 @@ module QuotationEvaluationTypes =
                     [linqAssignLower |> asExpr; linqLoop |> asExpr]
                 )
 
-            linqStatements |> asExpr
+            return' ζ <| linqStatements
         
         | Patterns.TryFinally(e,h) -> 
-            let eP = ConvExpr env (Expr.Lambda(new Var("unitVar",typeof<unit>), e))
-            let hP = ConvExpr env <@@ (fun () -> (%%h:unit)) @@>
+            let ζ, eP = ConvExpr ζ env (Expr.Lambda(new Var("unitVar",typeof<unit>), e))
+            let ζ, hP = ConvExpr ζ env <@@ (fun () -> (%%h:unit)) @@>
             let minfo = TryFinallyMethod.GetGenericMethodDefinition().MakeGenericMethod [| e.Type |]
-            Expression.Call(minfo,[| eP; hP |]) |> asExpr
+            return' ζ <| Expression.Call(minfo,[| eP; hP |])
         
         | Patterns.TryWith(e,vf,filter,vh,handler) -> 
-            let eP = ConvExpr env (Expr.Lambda(new Var("unitVar",typeof<unit>), e))
-            let filterP = ConvExpr env (Expr.Lambda(vf,filter))
-            let handlerP = ConvExpr env (Expr.Lambda(vh,handler))
+            let ζ, eP = ConvExpr ζ env (Expr.Lambda(new Var("unitVar",typeof<unit>), e))
+            let ζ, filterP = ConvExpr ζ env (Expr.Lambda(vf,filter))
+            let ζ, handlerP = ConvExpr ζ env (Expr.Lambda(vh,handler))
             let minfo = TryWithMethod.GetGenericMethodDefinition().MakeGenericMethod [| e.Type |]
-            Expression.Call(minfo,[| eP; filterP; handlerP |]) |> asExpr
+            return' ζ <| Expression.Call(minfo,[| eP; filterP; handlerP |])
 
         | Patterns.LetRecursive(binds,body) -> 
-
             let vfs = List.map fst binds
             
             let pass1 = 
@@ -752,13 +922,16 @@ module QuotationEvaluationTypes =
             let vfdTys    = pass1 |> List.map (fun (vf,vx,expr,domainTy,rangeTy,vfdTy,vfd) -> vfdTy) |> Array.ofList
             let vfds      = pass1 |> List.map (fun (vf,vx,expr,domainTy,rangeTy,vfdTy,vfd) -> vfd)
 
+            let zeta = ref ζ
             let FPs = 
                 [| for (vf,vx,expr,domainTy,rangeTy,vfdTy,vfd) in pass1 do
                       let expr = rw expr
                       let tyF = GetFuncType (Array.append vfdTys [| vx.Type; expr.Type |])
                       let F = Expr.NewDelegate(tyF,vfds@[vx],expr)
-                      let FP = ConvExpr env F
+                      let ζ, FP = ConvExpr (!zeta) env F
+                      zeta := ζ
                       yield FP |]
+            let ζ = !zeta
 
             let body = rw body
 
@@ -769,7 +942,7 @@ module QuotationEvaluationTypes =
                    yield body.Type |]
 
             let B = Expr.NewDelegate(GetFuncType (Array.append vfdTys [| body.Type |]),vfds,body)
-            let BP = ConvExpr env B
+            let ζ, BP = ConvExpr ζ env B
 
             let minfo = 
                 let q = 
@@ -786,7 +959,7 @@ module QuotationEvaluationTypes =
                 match q with Lambdas(_,Call(_,minfo,_)) -> minfo | _ -> failwith "couldn't find minfo"
 
             let minfo = minfo.GetGenericMethodDefinition().MakeGenericMethod methTys
-            Expression.Call(minfo,Array.append FPs [| BP |]) |> asExpr
+            return' ζ <| Expression.Call(minfo,Array.append FPs [| BP |])
 
         | Patterns.AddressOf _ -> raise <| new NotSupportedException("Address-of expressions may not be converted to LINQ expressions")
         | Patterns.AddressSet _ -> raise <| new NotSupportedException("Address-set expressions may not be converted to LINQ expressions")
@@ -795,24 +968,34 @@ module QuotationEvaluationTypes =
         | _ -> 
             raise <| new NotSupportedException(sprintf "Could not convert the following F# Quotation to a LINQ Expression Tree\n--------\n%A\n-------------\n" inp)
 
-    and ConvObjArg env objOpt coerceTo : Expression = 
+    and ConvObjArg (ζ:Functions) (env:ConvEnv) (objOpt:option<Expr>) coerceTo : Functions*Expression = 
         match objOpt with
         | Some(obj) -> 
-            let expr = ConvExpr env obj
+            let ζ, expr = ConvExpr ζ env obj
             match coerceTo with 
-            | None -> expr
-            | Some ty -> Expression.TypeAs(expr, ty) :> Expression
+            | None -> ζ, expr
+            | Some ty -> return' ζ <| Expression.TypeAs(expr, ty)
         | None -> 
-            null
+            ζ, null
 
-    and ConvExprs env es : Expression[] = 
-        es |> List.map (ConvExpr env) |> Array.ofList 
+    and ConvExprs (ζ:Functions) env es : Functions*Expression[] = 
+        (es, (ζ, []))
+        ||> List.foldBack (fun e (ζ, es)->
+             let ζ, expr = ConvExpr ζ env e
+             ζ, expr::es)
+        |> fun (ζ, es) ->
+            ζ, Array.ofList es
 
     and ConvVar (v: Var) = 
         //printf "** Expression .Parameter(%a, %a)\n" output_any ty output_any nm;
         Expression.Parameter(v.Type, v.Name)
 
-    let Conv (e: #Expr,eraseEquality) = ConvExpr { eraseEquality = eraseEquality; varEnv = Map.empty } (e :> Expr)
+    let Conv (e: #Expr,eraseEquality) =
+        let ζ = { Dummy = 0}
+
+        let ζ, exp = ConvExpr ζ { eraseEquality = eraseEquality; varEnv = Map.empty } (e :> Expr)
+
+        exp
 
     let CompileImpl (e: #Expr, eraseEquality) = 
        let ty = e.Type
